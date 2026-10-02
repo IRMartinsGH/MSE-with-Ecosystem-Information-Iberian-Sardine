@@ -5,4 +5,4 @@ Created for the "Data and Code Availability" section of the paper titled "Integr
 
 <br>
 
-This is an adaptation from ([FLBeia-MSE](https://github.com/ssanchezAZTI/FLBEIA_mseIBpil))).
+This is an adaptation from [FLBeia-MSE](https://github.com/ssanchezAZTI/FLBEIA_mseIBpil).
