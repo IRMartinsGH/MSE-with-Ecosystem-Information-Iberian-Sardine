@@ -1,0 +1,272 @@
+#########################################################
+#### Function to read from FLstock object,
+#### create SS3 files, from existing reference ones,
+#### run ss3 assessment with new data,
+#### update FLR stock object with estimates from SS3.
+#########################################################
+
+########################################################
+### Leire Citores september-october 2018 ###############
+########################################################
+
+ss32flbeia<-function(stock,indices,control,covars=covars){
+  
+  #save iteration number
+  runi<-control$run_it
+  
+  #first year of the new stock object
+  firsty <- as.numeric(range(stock)["minyear"])
+  
+  #last year of the new stock object
+  lasty<-as.numeric(range(stock)["maxyear"])
+  
+  ## if catch < 10^-5 , give small value to total catch, remove catch at age (done some lines later)
+  ## and put the wt from year before. Not to have problems in SS3
+  stock@catch.wt[,which(is.na(stock@catch.wt[2,]))]<-stock@catch.wt[,ac(2024)]
+  
+  stock@catch <- computeCatch(stock)
+  stock@catch[,which(stock@catch<10^-5)]<-10^-5
+  
+  #print
+  cat("catches in it",runi,range(stock)["maxyear"],"\n", stock@catch[,ac(range(stock)["maxyear"])],"\n")
+  
+  # --- PATH SETUP (all absolute, normalized for Windows compatibility) ---
+  
+  # get current working directory FIRST, before any setwd()
+  dir0 <- normalizePath(getwd(), mustWork=TRUE)
+  
+  # assess_dir: full absolute path to the directory containing ref folder
+  assess_dir <- normalizePath(control$assess_dir, mustWork=TRUE)
+  
+  # ref_name: full absolute path to the reference SS3 assessment folder
+  ref_name <- normalizePath(file.path(assess_dir, basename(control$ref_name)), mustWork=FALSE)
+  
+  # name of the temp folder (just the folder name, not full path)
+  dir_name <- paste0("assess_temp", runi, "_", lasty)
+  
+  # full absolute path to the temp folder
+  full_dir <- file.path(assess_dir, dir_name)
+  
+  # full absolute path to where SS3 will run (inside temp folder)
+  temp_dir <- file.path(full_dir, basename(ref_name))
+  
+  # --- CREATE TEMP ASSESSMENT FOLDER AND COPY FILES ---
+  
+  dir.create(full_dir, showWarnings=FALSE)
+  file.copy(ref_name, full_dir, recursive=TRUE)
+  
+  # verify temp_dir exists before trying to setwd into it
+  if (!dir.exists(temp_dir)) {
+    stop(paste("temp_dir does not exist:", temp_dir))
+  }
+  
+  setwd(temp_dir)
+  
+  ################################################################
+  #### read data from new FLR objects and write to SS3 files
+  #################################################################
+  
+  #read reference assessment data file
+  datss<-SS_readdat("sardine.dat",verbose=F)
+  
+  ##control file
+  ctl<-readLines("sardine.ctl")
+  
+  #natural mortality vector
+  ctl[55]<-paste(m(stock)[,1],collapse=" ")
+  #update the year in the control file (from reference assessment year to actual year)
+  ctl_new<-gsub(pattern = ac(datss$endyr), replace = ac(lasty), x = ctl)
+  #update the year recruitment devs (assessment year-1)
+  ctl_new<-gsub(pattern = ac(datss$endyr), replace = ac(lasty), x = ctl_new)
+  #update the year for natage for more stddev reporting
+  ctl_new <- gsub(pattern = ac(datss$endyr-1), replace = ac(datss$endyr-2), x = ctl_new)
+  #write the new control file, it overwrites the old one
+  writeLines(ctl_new, con="sardine.ctl")
+  
+  #total catch
+  catch<-melt(catch(stock)[,])[,c("value","year")]
+  catch$seas<-1
+  catch$fleet<-1
+  catch$catch_se<-0.05
+  catch <- catch[,c('year','seas','fleet','value','catch_se')]
+  colnames(catch)<-colnames(datss$catch)
+  #initial catch
+  initialCatch <- c(-999,1,1,135000,0.05)
+  catch <- rbind(initialCatch,catch)
+  datss$catch<-catch
+  
+  #age structured catch and index
+  catchn<-dcast(na.omit(melt(catch.n(stock)[,])[,c("value","year","age")]),year~age)
+  catchn<-cbind(catchn[,1],subset(datss$agecomp,fleet==1)[1,2:9],catchn[,-1])
+  lastrow<-dim(catchn)[1] 
+  #ADI!!! no catch at age for the last year
+  catchn<-catchn[-lastrow,]
+  ## remove catch at age when catch<10^4
+  catch0years<-which(catchn[,ac(4)]<10^-4)
+  if(length(catch0years)>0){
+    catchn<-catchn[-catch0years,]}
+  # set manually sample size for catch.n for years > 1999
+  catchn[,"Nsamp"][catchn[,1]>1990]<-75
+  
+  indexn<-dcast(na.omit(melt(indices[[1]]@index[,])[,c("value","year","age")]),year~age)
+  indexn<-cbind(indexn[,1],subset(datss$agecomp,fleet==2)[1,2:9],indexn[,-1])
+  colnames(indexn)<-colnames(catchn)<-colnames(datss$agecomp)
+  agecomp<-rbind(catchn,indexn)
+  datss$agecomp<-agecomp
+  
+  #biomass indices
+  index2<-cbind(indexn[,1],rowSums(indexn[,c(10:16)]))
+  se_log2<-subset(datss$CPUE,index==2)$se_log[1]
+  index2<-cbind(yr=index2[,1],month=4,index=2,obs=index2[,2],se_log=mean(se_log2))
+  
+  index3<-na.omit(melt(indices[[2]]@index[,])[,c("value","year")])
+  se_log3<-subset(datss$CPUE,index==3)$se_log[1]
+  index3<-cbind(yr=index3$year,month=1,index=3,obs=index3$value,se_log=se_log3)
+  
+  index4<-na.omit(melt(indices[[3]]@index[,])[,c("value","year")])
+  se_log4<-subset(datss$CPUE,index==4)$se_log[1]  # fixed: was index=4 (assignment instead of comparison)
+  index4<-cbind(yr=index4$year,month=10,index=4,obs=index4$value,se_log=se_log4)
+  
+  datss$CPUE<-as.data.frame(rbind(index2,index3,index4))
+  
+  #number of lines
+  datss$styr<-an(firsty)
+  datss$endyr<-an(lasty)
+  
+  #write the new data file, it overwrites the old one
+  SS_writedat(datss,"sardine.dat", overwrite = T,verbose=F, version="3.30")
+  
+  ##wtatage file
+  #stock weight (fleet=0)
+  stockwt<-t(stock.wt(stock)[,,drop=T])
+  stockwt<-cbind(rownames(stockwt),1,1,1,1,0,stockwt)
+  stockwt<-apply(stockwt,1,function(x){paste(x,collapse="\t")})
+  names(stockwt)<-NULL
+  
+  # weight for age structured acoustic index (fleet=2)
+  index2wt<-t(stock.wt(stock)[,,drop=T])
+  index2wt<-cbind(rownames(index2wt),1,1,1,1,2,index2wt)
+  index2wt<-apply(index2wt,1,function(x){paste(x,collapse="\t")})
+  names(index2wt)<-NULL
+  
+  #catch weight (fleet 1 and -1)
+  catchwt<-t(catch.wt(stock)[,,drop=T])
+  catchwt<-cbind(rownames(catchwt),1,1,1,1,1,catchwt)
+  catchwt<-apply(catchwt,1,function(x){paste(x,collapse="\t")})
+  names(catchwt)<-NULL
+  
+  catchwt_1<-t(catch.wt(stock)[,,drop=T])
+  catchwt_1<-cbind(rownames(catchwt_1),1,1,1,1,-1,catchwt_1)
+  catchwt_1<-apply(catchwt_1,1,function(x){paste(x,collapse="\t")})
+  names(catchwt_1)<-NULL
+  
+  #maturity (fleet=-2)
+  mat<-round(t((mat(stock)*stock.wt(stock))[,,drop=T]),3)
+  mat<-cbind(rownames(mat),1,1,1,1,-2,mat)
+  mat<-apply(mat,1,function(x){paste(x,collapse="\t")})
+  names(mat)<-NULL
+  
+  # weight for DEPM index (fleet=3)
+  index3wt<-t(stock.wt(stock)[,,drop=T])
+  index3wt<-cbind(rownames(index3wt),1,1,1,1,3,index3wt)
+  index3wt<-apply(index3wt,1,function(x){paste(x,collapse="\t")})
+  names(index3wt)<-NULL
+  
+  # weight for Recruitment index (fleet=4)
+  index4wt<-t(catch.wt(stock)[,,drop=T])
+  index4wt<-cbind(rownames(index4wt),1,1,1,1,4,index4wt)
+  index4wt<-apply(index4wt,1,function(x){paste(x,collapse="\t")})
+  names(index4wt)<-NULL
+  
+  #read the reference weight file
+  wta<-readLines("wtatage.ss")[1:8] 
+  #terminator line
+  terLine <- c(-9999, 1, 1, 1, 1, 0,  0, 0.023, 0.044, 0.053, 0.058, 0.060, 0.068)
+  terLine <- paste(terLine,collapse = "\t")
+  wta_new<-c(wta,stockwt,catchwt,mat,catchwt_1,index2wt,index3wt,index4wt,terLine)
+  writeLines(wta_new, con="wtatage.ss")
+  
+  ################################################################
+  ##                        execute SS3 
+  ################################################################
+  
+  system("./ss3.exe")
+  #system("./ss3 -nohess")
+  # rename ss3.log to ss.log for r4ss compatibility (version difference)
+  if (file.exists("ss3.log") & !file.exists("ss.log")) {
+    file.copy("ss3.log", "ss.log")
+  }
+  
+  #####################################################
+  ### SS3 output back to FLR. Just harvest and stock:
+  #####################################################
+  
+  dir.assess <- normalizePath(getwd(), mustWork=TRUE)
+  assess <- SS_output(dir = dir.assess, forecast=F, printstats=F, verbose=F, covar=F)
+  maxyear <- assess$endyr 
+  ages <- assess$agebins
+  years <- assess$startyr:assess$endyr
+  
+  # F-AT-AGE
+  selectivity <- subset(assess$ageselex, Fleet==1 & Factor=="Asel2" & Yr %in% years, select=c("Yr", ac(ages)))
+  
+  idx <- grep("^F_", assess$derived_quants$Label)
+  f.apical <- data.frame(f=assess$derived_quants[idx,"Value"])
+  f.apical$Yr <- years
+  
+  f.apsel <- merge(f.apical, selectivity, all.x = T,by="Yr")
+  
+  f <- f.apsel$f * f.apsel[,ac(ages)]
+  
+  harvest=FLQuant(unname(as.matrix(t(f))),quant="age",units="f", 
+                  dimnames=list(age=ac(ages), year=ac(years)))
+  
+  # NUMBERS-AT-AGE
+  natage <- subset(assess$natage, Era=="TIME" & `Beg/Mid`=="B" , select=ac(ages))
+  
+  stock.n <- FLQuant(unname(as.matrix(t(natage))), quant='age', units='NA', 
+                     dimnames=list(age=ac(ages), year=ac(years)))
+  
+  #update stock object
+  stock@harvest<-harvest
+  stock@stock.n<-stock.n
+  stock@stock<-computeStock(stock)
+  
+  ##fill covars to see retros
+  covars$ssb[ac(lasty),ac(years)]<-ssb(stock)[,]
+  covars$rec[ac(lasty),ac(years)]<-rec(stock)[,]
+  covars$fbar[ac(lasty),ac(years)]<-fbar(stock)[,]
+  
+  params<-assess$parameters
+  q2<-exp(subset(params,Label=="LnQ_base_Acoustic_survey(2)")[,"Value"])
+  q3<-exp(subset(params,Label=="LnQ_base_DEPM_survey(3)")[,"Value"])
+  q4<-exp(subset(params,Label=="LnQ_base_Rec_survey(4)")[,"Value"])
+  covars$qs[1,ac(lasty)]<-q2
+  covars$qs[2,ac(lasty)]<-q3
+  covars$qs[3,ac(lasty)]<-q4
+  
+  covars$sel[,ac(lasty),3,,,]<-as.numeric(subset(selectivity,Yr==lasty)[1,-1])
+  covars$sel[,ac(lasty),2,,,]<-as.numeric(subset(selectivity,Yr==2004)[1,-1])
+  covars$sel[,ac(lasty),1,,,]<-as.numeric(subset(selectivity,Yr==1986)[1,-1])
+  
+  covars$conv[,ac(lasty)]<-assess$maximum_gradient_component
+  
+  Bzerofish <- assess$Dynamic_Bzero[dim(assess$Dynamic_Bzero)[1],c('SSB')]
+  Bzeronofish <- assess$Dynamic_Bzero[dim(assess$Dynamic_Bzero)[1],c('SSB_nofishing')]
+  
+  if(length(Bzerofish) != 0){
+    covars$Bzerofish[,ac(lasty)]<-Bzerofish
+    covars$Bzeronofish[,ac(lasty)]<-Bzeronofish
+  } else {
+    covars$Bzerofish[,ac(lasty)]<-NA
+    covars$Bzeronofish[,ac(lasty)]<-NA
+  }
+  
+  #######################
+  ### return to original dir and delete temp files
+  #######################
+  setwd(dir0)
+  unlink(full_dir, recursive=TRUE)
+  
+  return(list(stock = stock, covars=covars))
+}
